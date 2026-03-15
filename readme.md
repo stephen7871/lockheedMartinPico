@@ -27,7 +27,7 @@ Device used:
 /dev/i2c-1
 ```
 
-Check sensor detection:
+Check sensor detection (on Pico via ssh):
 
 ```
 i2cdetect -y 1
