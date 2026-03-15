@@ -1,114 +1,119 @@
+#include "app/packet_builder.hpp"
+#include "config.hpp"
+#include "hardware/spi_demo.hpp"
+#include "network/udp_sender.hpp"
+#include "sensor/bme280_driver.hpp"
+
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
-#include "app/packet_builder.hpp"
-#include "hw/i2c_bus.hpp"
-#include "hw/spi_bus.hpp"
-#include "net/udp_client.hpp"
-#include "sensor/bme280_driver.hpp"
-
-// Implemented in the Linux source files
-II2CBus* create_linux_i2c_bus(const std::string& device_path);
-ISpiBus* create_linux_spi_bus(const std::string& device_path);
-
-namespace {
-void print_usage() {
-    std::cout
-        << "Usage:\n"
-        << "  ./protocol_demo i2c <i2c_dev> <hex_addr> <target_ip> <target_port>\n"
-        << "  ./protocol_demo spi <spi_dev> <target_ip> <target_port>\n\n"
-        << "Examples:\n"
-        << "  ./protocol_demo i2c /dev/i2c-1 0x76 192.168.1.20 5000\n"
-        << "  ./protocol_demo spi /dev/spidev0.0 192.168.1.20 5000\n";
-}
-}
-
-int main(int argc, char** argv) {
-    try {
-        if (argc < 5) {
-            print_usage();
-            return 1;
-        }
-
-        const std::string mode = argv[1];
-        UdpClient udp;
-
-        if (mode == "i2c") {
-            if (argc != 6) {
-                print_usage();
-                return 1;
-            }
-
-            const std::string i2c_dev = argv[2];
-            const auto addr = static_cast<uint8_t>(std::stoul(argv[3], nullptr, 16));
-            const std::string target_ip = argv[4];
-            const auto target_port = static_cast<uint16_t>(std::stoi(argv[5]));
-
-            std::unique_ptr<II2CBus> bus(create_linux_i2c_bus(i2c_dev));
-            Bme280I2cDriver driver(*bus, addr);
-
-            if (!driver.initialize()) {
-                std::cerr << "Failed to initialize BME280 over I2C\n";
-                return 2;
-            }
-
-            for (int i = 0; i < 10; ++i) {
-                const auto chip_id = driver.read_chip_id();
-                const auto sample = driver.read_raw_sample();
-                const auto packet = build_udp_packet("i2c", sample, chip_id);
-
-                std::cout << packet << '\n';
-                if (!udp.send_to(target_ip, target_port, packet)) {
-                    std::cerr << "UDP send failed\n";
-                    return 3;
-                }
-
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-        } else if (mode == "spi") {
-            if (argc != 5) {
-                print_usage();
-                return 1;
-            }
-
-            const std::string spi_dev = argv[2];
-            const std::string target_ip = argv[3];
-            const auto target_port = static_cast<uint16_t>(std::stoi(argv[4]));
-
-            std::unique_ptr<ISpiBus> bus(create_linux_spi_bus(spi_dev));
-            Bme280SpiDriver driver(*bus);
-
-            if (!driver.initialize()) {
-                std::cerr << "Failed to initialize BME280 over SPI\n";
-                return 2;
-            }
-
-            for (int i = 0; i < 10; ++i) {
-                const auto chip_id = driver.read_chip_id();
-                const auto sample = driver.read_raw_sample();
-                const auto packet = build_udp_packet("spi", sample, chip_id);
-
-                std::cout << packet << '\n';
-                if (!udp.send_to(target_ip, target_port, packet)) {
-                    std::cerr << "UDP send failed\n";
-                    return 3;
-                }
-
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
-        } else {
-            print_usage();
-            return 1;
-        }
-
-        return 0;
-    } catch (const std::exception& ex) {
-        std::cerr << "Fatal error: " << ex.what() << '\n';
-        return 99;
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: ./pi_zero_telemetry <MAC_IP> [UDP_PORT]\n";
+        return 1;
     }
+
+    const std::string mac_ip = argv[1];
+    const uint16_t udp_port =
+        (argc >= 3) ? static_cast<uint16_t>(std::stoi(argv[2])) : config::UDP_PORT;
+
+    std::cout << "Starting telemetry app\n";
+    std::cout << "Destination: " << mac_ip << ":" << udp_port << "\n";
+
+    // Try BME280 on 0x76, then 0x77
+    BME280Driver sensor_primary(config::I2C_DEVICE, config::BME280_ADDR_PRIMARY);
+    BME280Driver sensor_secondary(config::I2C_DEVICE, config::BME280_ADDR_SECONDARY);
+
+    BME280Driver* active_sensor = nullptr;
+
+    if (sensor_primary.initialize()) {
+        active_sensor = &sensor_primary;
+        std::cout << "BME280 initialized at I2C address 0x76\n";
+    } else if (sensor_secondary.initialize()) {
+        active_sensor = &sensor_secondary;
+        std::cout << "BME280 initialized at I2C address 0x77\n";
+    } else {
+        std::cerr << "Failed to initialize BME280 on 0x76 or 0x77\n";
+        return 1;
+    }
+
+    UdpSender sender(mac_ip, udp_port);
+    if (!sender.initialize()) {
+        std::cerr << "Failed to initialize UDP sender\n";
+        return 1;
+    }
+
+    SPIDemo spi(
+        config::SPI_DEVICE,
+        config::SPI_SPEED_HZ,
+        config::SPI_MODE,
+        config::SPI_BITS_PER_WORD
+    );
+
+    bool spi_ready = spi.initialize();
+    if (spi_ready) {
+        std::cout << "SPI initialized on " << config::SPI_DEVICE << "\n";
+        std::cout << "Optional self-test: jumper MOSI to MISO for loopback verification\n";
+    } else {
+        std::cout << "SPI initialization failed. Continuing with I2C + UDP demo.\n";
+    }
+
+    uint64_t sequence = 0;
+
+    while (true) {
+        try {
+            SensorReading reading = active_sensor->read();
+
+            bool spi_test_ran = false;
+            bool spi_test_passed = false;
+            std::vector<uint8_t> spi_tx;
+            std::vector<uint8_t> spi_rx;
+
+            if (spi_ready && (sequence % config::SPI_DEMO_EVERY_N_LOOPS == 0)) {
+                spi_test_ran = true;
+                spi_tx = {0xAA, 0x55, 0x0F, 0xF0};
+                spi_rx = spi.transfer(spi_tx);
+                spi_test_passed = (!spi_rx.empty() && spi_rx == spi_tx);
+            }
+
+            std::string payload = PacketBuilder::buildTelemetryJson(
+                sequence,
+                reading,
+                spi_test_ran,
+                spi_test_passed,
+                spi_tx,
+                spi_rx
+            );
+
+            bool ok = sender.send(payload);
+
+            std::cout << "seq=" << sequence
+                      << " temp=" << reading.temperature_c << "C"
+                      << " hum=" << reading.humidity_percent << "%"
+                      << " pressure=" << reading.pressure_hpa << "hPa"
+                      << " udp=" << (ok ? "sent" : "failed")
+                      << "\n";
+
+            if (spi_test_ran) {
+                std::cout << "SPI demo ran, loopback result="
+                          << (spi_test_passed ? "PASS" : "NO LOOPBACK / FAIL")
+                          << "\n";
+            }
+
+            ++sequence;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(config::TELEMETRY_INTERVAL_MS)
+            );
+        } catch (const std::exception& ex) {
+            std::cerr << "Read/send error: " << ex.what() << "\n";
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+
+    return 0;
 }
